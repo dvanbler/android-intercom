@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Intercom</string>
+    <string name="attribution_ptt">Push-to-Talk</string>
+</resources>
