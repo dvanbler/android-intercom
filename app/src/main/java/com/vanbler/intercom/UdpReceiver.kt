@@ -16,9 +16,9 @@ import java.net.DatagramSocket
 class UdpReceiver(private val context: Context) {
 
     companion object {
-        private const val SAMPLE_RATE = 32000
+        private const val SAMPLE_RATE = 11025
         private const val CHUNK_SIZE = 548
-        private const val PORT = 6769
+        private const val PORT = 6770
     }
 
     private val scope = CoroutineScope(Dispatchers.IO)

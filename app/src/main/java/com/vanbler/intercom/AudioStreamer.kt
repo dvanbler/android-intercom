@@ -9,9 +9,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Build
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -30,16 +28,11 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
 
     private var activeJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
+    private val reverb = ReverbProcessor(delaySamples = 3200, decay = 0.3f)
 
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
-
-    fun streamMic() {
-        launchExclusive {
-            streamMicInternal()
-        }
-    }
 
     fun streamWavThenMic(resId: Int) {
         launchExclusive {
@@ -54,7 +47,14 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         }
     }
 
+    fun streamMic() {
+        launchExclusive {
+            streamMicInternal()
+        }
+    }
+
     fun stop() {
+        reverb.reset()
         activeJob?.cancel()
         activeJob = null
     }
@@ -63,7 +63,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
     // Internal streaming logic
     // -------------------------------------------------------------------------
 
-    @OptIn(ExperimentalCoroutinesApi::class, DelicateCoroutinesApi::class)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private fun CoroutineScope.streamWavFileInternal(resId: Int) {
         val pcmData = loadPcmFromWav(resId)
 
@@ -99,8 +99,6 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         audioTrack.play()
 
         val audioQueue = LinkedBlockingQueue<ByteArray>()
-
-        // Dedicated thread for AudioTrack writes so it never blocks the UDP send loop
         val audioThread = newSingleThreadContext("AudioTrackWriter")
         val audioJob = launch(audioThread) {
             while (isActive) {
@@ -120,13 +118,11 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
                     pcmData.copyInto(it, destinationOffset = 0, startIndex = offset, endIndex = end)
                 }
 
-                // Busy wait for accurate packet timing — must be before send
-                // so AudioTrack.write() blocking cannot affect UDP interval
                 val sleepUntil = startTime + (bytesSent * 1_000_000_000L / SAMPLE_RATE)
                 while (System.nanoTime() < sleepUntil) { /* busy wait */ }
 
                 udpSender.send(chunk)
-                audioQueue.offer(chunk)  // non-blocking hand-off to AudioTrack thread
+                audioQueue.offer(chunk)
 
                 bytesSent += CHUNK_SIZE
                 offset += CHUNK_SIZE
@@ -164,6 +160,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
             while (isActive) {
                 val bytesRead = audioRecord.read(buffer, 0, CHUNK_SIZE)
                 if (bytesRead > 0) {
+                    reverb.process(buffer, bytesRead)
                     udpSender.send(buffer)
                 }
             }
