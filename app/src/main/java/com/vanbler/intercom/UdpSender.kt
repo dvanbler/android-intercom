@@ -6,7 +6,7 @@ import java.net.InetAddress
 
 class UdpSender(private val address: InetAddress, private val port:Int) {
 
-    private val socket = DatagramSocket();
+    private val socket = DatagramSocket()
 
     fun send(data: ByteArray) {
         val packet = DatagramPacket(data, data.size, address, port)

@@ -16,6 +16,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newSingleThreadContext
+import kotlinx.coroutines.runBlocking
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -33,6 +34,12 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    fun streamMic() {
+        launchExclusive {
+            streamMicInternal()
+        }
+    }
 
     fun streamWavThenMic(resId: Int) {
         launchExclusive {
@@ -126,6 +133,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
             }
         } finally {
             audioJob.cancel()
+            runBlocking { audioJob.join() }
             audioThread.close()
             audioTrack.stop()
             audioTrack.release()
@@ -142,7 +150,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         val bufferSize = maxOf(minBuffer, CHUNK_SIZE)
 
         val audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_8BIT,
