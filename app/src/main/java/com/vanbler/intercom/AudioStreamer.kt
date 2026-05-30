@@ -9,7 +9,9 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Build
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -22,7 +24,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
 
     companion object {
         private const val SAMPLE_RATE = 32000
-        private const val CHUNK_SIZE = 548
+        private const val MAX_CHUNK_SIZE = 548
         private const val WAV_HEADER_SIZE = 44
     }
 
@@ -63,9 +65,16 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
     // Internal streaming logic
     // -------------------------------------------------------------------------
 
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private fun launchExclusive(block: suspend CoroutineScope.() -> Unit) {
+        activeJob?.cancel()
+        activeJob = scope.launch(block = block)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class, DelicateCoroutinesApi::class)
     private fun CoroutineScope.streamWavFileInternal(resId: Int) {
         val pcmData = loadPcmFromWav(resId)
+
+        Thread.sleep(50)
 
         val audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
@@ -108,24 +117,23 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         }
 
         val startTime = System.nanoTime()
-        var bytesSent = 0L
         var offset = 0
 
         try {
             while (isActive && offset < pcmData.size) {
-                val end = minOf(offset + CHUNK_SIZE, pcmData.size)
-                val chunk = ByteArray(CHUNK_SIZE).also {
+                val end = minOf(offset + MAX_CHUNK_SIZE, pcmData.size)
+                val chunkLen = end - offset
+                val chunk = ByteArray(chunkLen).also {
                     pcmData.copyInto(it, destinationOffset = 0, startIndex = offset, endIndex = end)
                 }
 
-                val sleepUntil = startTime + (bytesSent * 1_000_000_000L / SAMPLE_RATE)
+                val sleepUntil = startTime + (offset * 1_000_000_000L / SAMPLE_RATE)
                 while (System.nanoTime() < sleepUntil) { /* busy wait */ }
 
                 udpSender.send(chunk)
                 audioQueue.offer(chunk)
 
-                bytesSent += CHUNK_SIZE
-                offset += CHUNK_SIZE
+                offset += chunkLen
             }
         } finally {
             audioJob.cancel()
@@ -143,7 +151,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_8BIT
         )
-        val bufferSize = maxOf(minBuffer, CHUNK_SIZE)
+        val bufferSize = maxOf(minBuffer, MAX_CHUNK_SIZE)
 
         val audioRecord = AudioRecord(
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -154,11 +162,11 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         )
 
         audioRecord.startRecording()
-        val buffer = ByteArray(CHUNK_SIZE)
+        val buffer = ByteArray(MAX_CHUNK_SIZE)
 
         try {
             while (isActive) {
-                val bytesRead = audioRecord.read(buffer, 0, CHUNK_SIZE)
+                val bytesRead = audioRecord.read(buffer, 0, MAX_CHUNK_SIZE)
                 if (bytesRead > 0) {
                     reverb.process(buffer, bytesRead)
                     udpSender.send(buffer)
@@ -176,11 +184,12 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
 
     private fun loadPcmFromWav(resId: Int): ByteArray {
         val raw = context.resources.openRawResource(resId).readBytes()
-        return raw.drop(WAV_HEADER_SIZE).toByteArray()
+        // Data chunk size is at offset 40, little-endian
+        val dataSize = (raw[40].toInt() and 0xFF) or
+                ((raw[41].toInt() and 0xFF) shl 8) or
+                ((raw[42].toInt() and 0xFF) shl 16) or
+                ((raw[43].toInt() and 0xFF) shl 24)
+        return raw.copyOfRange(WAV_HEADER_SIZE, WAV_HEADER_SIZE + dataSize)
     }
 
-    private fun launchExclusive(block: suspend CoroutineScope.() -> Unit) {
-        activeJob?.cancel()
-        activeJob = scope.launch(block = block)
-    }
 }
