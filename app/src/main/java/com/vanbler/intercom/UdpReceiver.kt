@@ -1,9 +1,11 @@
 package com.vanbler.intercom
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.net.wifi.WifiManager
 import android.os.Build
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +14,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetAddress
 
 class UdpReceiver(private val context: Context) {
 
@@ -62,9 +65,15 @@ class UdpReceiver(private val context: Context) {
 
             audioTrack.play()
 
-            val udpSocket = DatagramSocket(PORT)
+            val udpSocket = DatagramSocket(PORT, InetAddress.getByName("0.0.0.0"))
+            udpSocket.broadcast = true
             udpSocket.soTimeout = 200  // unblock every 200ms to check isActive/paused
             socket = udpSocket
+
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val multicastLock = wifiManager.createMulticastLock("PTT_Broadcast_Lock")
+            // Acquire the lock to force the Wi-Fi chip to listen to broadcasts
+            multicastLock.acquire()
 
             val buffer = ByteArray(CHUNK_SIZE)
             val packet = DatagramPacket(buffer, buffer.size)
@@ -81,6 +90,9 @@ class UdpReceiver(private val context: Context) {
                     }
                 }
             } finally {
+                if (multicastLock.isHeld) {
+                    multicastLock.release()
+                }
                 audioTrack.stop()
                 audioTrack.release()
                 udpSocket.close()
