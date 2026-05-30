@@ -31,6 +31,7 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
     private var activeJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
     private val reverb = ReverbProcessor(delaySamples = 3200, decay = 0.3f)
+    private val fadeInBuffer = ByteArray(128) { i -> i.toByte() }
 
     // -------------------------------------------------------------------------
     // Public API
@@ -119,6 +120,8 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         val startTime = System.nanoTime()
         var offset = 0
 
+        udpSender.send(fadeInBuffer)
+
         try {
             while (isActive && offset < pcmData.size) {
                 val end = minOf(offset + MAX_CHUNK_SIZE, pcmData.size)
@@ -163,6 +166,8 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
 
         audioRecord.startRecording()
         val buffer = ByteArray(MAX_CHUNK_SIZE)
+
+        udpSender.send(fadeInBuffer)
 
         try {
             while (isActive) {
