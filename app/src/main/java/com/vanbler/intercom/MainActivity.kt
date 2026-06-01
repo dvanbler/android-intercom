@@ -44,6 +44,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.vanbler.intercom.ui.theme.IntercomTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.InetAddress
 
@@ -54,13 +60,15 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TARGET_HOST = "192.168.143.15"
         private const val TARGET_PORT = 6769
+        private const val HEARTBEAT_PORT = 6771
         private val PTT_INTRO_RES = R.raw.ptt_intro
     }
 
     private lateinit var udpSender: UdpSender
     private lateinit var audioStreamer: AudioStreamer
     private lateinit var udpReceiver: UdpReceiver
-
+    private var heartbeatJob: Job? = null
+    private val heartbeatScope = CoroutineScope(Dispatchers.IO)
     private var onPermissionResult: (Boolean) -> Unit = {}
 
     private val requestPermissionLauncher =
@@ -295,5 +303,27 @@ class MainActivity : ComponentActivity() {
         audioStreamer.stop()
         udpSender.close()
         udpReceiver.stop()
+        heartbeatScope.cancel()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        heartbeatJob = heartbeatScope.launch {
+            val payload = byteArrayOf(1)  // minimal payload
+            while (isActive) {
+                try {
+                    udpSender.sendTo(payload, HEARTBEAT_PORT)
+                } catch (_: Exception) {
+                    // ignore transient send failures
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        heartbeatJob?.cancel()
+        heartbeatJob = null
     }
 }
