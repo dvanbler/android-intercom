@@ -11,6 +11,7 @@ import android.os.Build
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
@@ -39,20 +40,49 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
 
     fun streamWavThenMic(resId: Int) {
         launchExclusive {
-            streamWavFileInternal(resId)
+            streamPcmInternal(loadPcmFromWav(resId), toSpeaker = true, toUdp = true)
             if (isActive) streamMicInternal()
         }
     }
 
     fun streamWav(resId: Int) {
         launchExclusive {
-            streamWavFileInternal(resId)
+            streamPcmInternal(loadPcmFromWav(resId), toSpeaker = true, toUdp = true)
         }
     }
 
     fun streamMic() {
         launchExclusive {
             streamMicInternal()
+        }
+    }
+
+    /**
+     * Local-only preview (speaker, no UDP). [onCompleted] fires only on natural
+     * completion — NOT on cancellation — so the caller can resume the receiver
+     * without fighting an interrupting action that owns its own pause/resume.
+     */
+    fun previewPcm(pcm: ByteArray, onCompleted: () -> Unit) {
+        launchExclusive {
+            streamPcmInternal(pcm, toSpeaker = true, toUdp = false)
+            if (isActive) onCompleted()
+        }
+    }
+
+    /**
+     * Hold-to-send: optional chime (from a raw WAV res) then the speech buffer,
+     * both to speaker + UDP. Releasing the button calls [stop], which cancels
+     * mid-stream — the kill switch. If released during the chime, the isActive
+     * gate skips the speech entirely.
+     */
+    fun sendSpeech(speechPcm: ByteArray, chimeResId: Int?) {
+        launchExclusive {
+            if (chimeResId != null) {
+                streamPcmInternal(loadPcmFromWav(chimeResId), toSpeaker = true, toUdp = true)
+            }
+            if (isActive) {
+                streamPcmInternal(speechPcm, toSpeaker = true, toUdp = true)
+            }
         }
     }
 
@@ -71,56 +101,73 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
         activeJob = scope.launch(block = block)
     }
 
+    /**
+     * Streams a pre-converted 32kHz/8-bit/unsigned PCM buffer.
+     *   toSpeaker — play locally via AudioTrack (writer thread + queue)
+     *   toUdp     — send 548-byte packets over UDP, paced to 32kHz
+     * Pacing (the busy-wait) is kept on always so local playback runs at correct
+     * real-time speed and the UDP feed never bursts.
+     */
     @OptIn(ExperimentalCoroutinesApi::class, DelicateCoroutinesApi::class)
-    private fun CoroutineScope.streamWavFileInternal(resId: Int) {
-        val pcmData = loadPcmFromWav(resId)
-
+    private fun CoroutineScope.streamPcmInternal(
+        pcmData: ByteArray,
+        toSpeaker: Boolean,
+        toUdp: Boolean
+    ) {
         Thread.sleep(50)
 
-        val audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE)
-                    .setEncoding(AudioFormat.ENCODING_PCM_8BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(
-                AudioTrack.getMinBufferSize(
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_8BIT
-                )
-            )
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .apply {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    setContext(context)
-                }
-            }
-            .build()
-
-        audioTrack.play()
-
+        var audioTrack: AudioTrack? = null
+        var audioThread: ExecutorCoroutineDispatcher? = null
+        var audioJob: Job? = null
         val audioQueue = LinkedBlockingQueue<ByteArray>()
-        val audioThread = newSingleThreadContext("AudioTrackWriter")
-        val audioJob = launch(audioThread) {
-            while (isActive) {
-                val chunk = audioQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
-                audioTrack.write(chunk, 0, chunk.size)
+
+        if (toSpeaker) {
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(SAMPLE_RATE)
+                        .setEncoding(AudioFormat.ENCODING_PCM_8BIT)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(
+                    AudioTrack.getMinBufferSize(
+                        SAMPLE_RATE,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_8BIT
+                    )
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .apply {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        setContext(context)
+                    }
+                }
+                .build()
+
+            audioTrack.play()
+
+            val dispatcher = newSingleThreadContext("AudioTrackWriter")
+            audioThread = dispatcher
+            val track = audioTrack
+            audioJob = launch(dispatcher) {
+                while (isActive) {
+                    val chunk = audioQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    track.write(chunk, 0, chunk.size)
+                }
             }
         }
 
         val startTime = System.nanoTime()
         var offset = 0
 
-        udpSender.send(fadeInBuffer)
+        if (toUdp) udpSender.send(fadeInBuffer)
 
         try {
             while (isActive && offset < pcmData.size) {
@@ -133,17 +180,19 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
                 val sleepUntil = startTime + (offset * 1_000_000_000L / SAMPLE_RATE)
                 while (System.nanoTime() < sleepUntil) { /* busy wait */ }
 
-                udpSender.send(chunk)
-                audioQueue.offer(chunk)
+                if (toUdp) udpSender.send(chunk)
+                if (toSpeaker) audioQueue.offer(chunk)
 
                 offset += chunkLen
             }
         } finally {
-            audioJob.cancel()
-            runBlocking { audioJob.join() }
-            audioThread.close()
-            audioTrack.stop()
-            audioTrack.release()
+            if (toSpeaker) {
+                audioJob?.cancel()
+                runBlocking { audioJob?.join() }
+                audioThread?.close()
+                audioTrack?.stop()
+                audioTrack?.release()
+            }
         }
     }
 
@@ -196,5 +245,4 @@ class AudioStreamer(private val udpSender: UdpSender, private val context: Conte
                 ((raw[43].toInt() and 0xFF) shl 24)
         return raw.copyOfRange(WAV_HEADER_SIZE, WAV_HEADER_SIZE + dataSize)
     }
-
 }
